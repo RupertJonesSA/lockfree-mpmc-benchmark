@@ -2,9 +2,7 @@
 
 Timer::Timer() { startTimepoint_ = std::chrono::high_resolution_clock::now(); }
 
-Timer::~Timer() { Stop(); }
-
-void Timer::Stop() {
+double Timer::Stop() {
   auto endTimepoint = std::chrono::high_resolution_clock::now();
   auto start =
       std::chrono::time_point_cast<std::chrono::microseconds>(startTimepoint_)
@@ -18,5 +16,5 @@ void Timer::Stop() {
   auto duration = stop - start;
   double ms = duration * 0.001;
 
-  std::cout << duration << "us (" << ms << "ms)\n";
+  return ms;
 }

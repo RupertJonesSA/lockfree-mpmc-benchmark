@@ -12,19 +12,6 @@
 #include <utility>
 
 template <typename T, const std::size_t N> class mpmc_lock_ring {
-public:
-  static_assert(N > 1, "capacity must be > 1");
-  static_assert((N & (N - 1)) == 0,
-                "capacity must be a power of two for optimal performance");
-
-  mpmc_lock_ring();
-  ~mpmc_lock_ring();
-  bool try_enqueue(const T &);
-  bool try_enqueue(T &&);
-  bool try_dequeue(T &);
-
-  static constexpr std::size_t capacity() { return N; }
-
 private:
   std::mutex mlck_;
 
@@ -36,6 +23,23 @@ private:
   std::size_t tail_{0}; // producer index
 
   std::array<T, N> buf_;
+
+public:
+  static_assert(N > 1, "capacity must be > 1");
+  static_assert((N & (N - 1)) == 0,
+                "capacity must be a power of two for optimal performance");
+
+  mpmc_lock_ring();
+  ~mpmc_lock_ring();
+  bool try_enqueue(const T &);
+  bool try_enqueue(T &&);
+  bool try_dequeue(T &);
+
+  template <typename Titerator>
+  std::size_t try_enqueue_batch(Titerator, Titerator);
+
+  static constexpr std::size_t capacity() { return N; }
+  static constexpr bool hasBatch() { return false; }
 };
 
 template <typename T, std::size_t N> mpmc_lock_ring<T, N>::mpmc_lock_ring() {
@@ -94,4 +98,12 @@ bool mpmc_lock_ring<T, N>::try_dequeue(T &item) {
   sem_post(&empty_cells_); // notify producers of new empty cell
   return true;
 }
+
+template <typename T, std::size_t N>
+template <typename Titerator>
+std::size_t mpmc_lock_ring<T, N>::try_enqueue_batch(Titerator start,
+                                                    Titerator end) {
+  return 0;
+}
+
 #endif // MPMC_LOCK_RING_HPP

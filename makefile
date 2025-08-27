@@ -2,6 +2,9 @@ CXX := g++
 CXXFLAGS := -std=c++20 -Wall -Wextra -O2 -pthread
 DEBUG_FLAGS := -g -DDEBUG -fsanitize=thread
 RELEASE_FLAGS := -03 -DNDEBUG -march=native
+VALGRIND_FLAGS := --leak-check=full --show-leak-kinds=all \
+									--track-origins=yes --num-callers=50 \
+									--error-exitcode=1
 
 SRC_DIR := .
 BUILD_DIR := build
@@ -11,7 +14,7 @@ SOURCES := main.cpp performance.cpp
 HEADERS := mpmc_ring.hpp mpmc_lock_ring.hpp performance.hpp
 OBJECTS := $(SOURCES:%.cpp=$(BUILD_DIR)/%.o)
 
-.PHONY: all clean debug release run help
+.PHONY: all clean debug release run help memory
 
 all: $(TARGET)
 
@@ -35,6 +38,10 @@ run: $(TARGET)
 
 clean:
 	rm -rf $(BUILD_DIR) $(TARGET)
+
+memory:
+	$(CXX) $(CXXFLAGS) $(MEMORY_FLAGS) $(SOURCES) -o $(TARGET)
+	valgrind $(VALGRIND_FLAGS) ./$(TARGET)
 
 # Help target
 help:
