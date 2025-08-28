@@ -7,103 +7,77 @@
 #ifndef MPMC_LOCK_RING_HPP
 #define MPMC_LOCK_RING_HPP
 #include <array>
-#include <mutex>
 #include <semaphore.h>
-#include <utility>
 
-template <typename T, const std::size_t N> class mpmc_lock_ring {
+template <typename T, const std::size_t BUFFER_SIZE> class mpmc_lock_ring {
 private:
-  std::mutex mlck_;
-
-  sem_t empty_cells_,
-      full_cells_; // unfortunately C++20 std::counting_semaphore suffers from
-                   // deadlock bug
+  sem_t empty_cells_, full_cells_,
+      mlck_; // unfortunately C++20 std::counting_semaphore suffers from
+             // deadlock bug; note that std::mutex interfers with sem_t (use
+             // only one)
 
   std::size_t head_{0}; // consumer index
   std::size_t tail_{0}; // producer index
 
-  std::array<T, N> buf_;
+  std::array<T, BUFFER_SIZE> buffer_;
+  std::size_t buffer_mask_{BUFFER_SIZE - 1};
 
 public:
-  static_assert(N > 1, "capacity must be > 1");
-  static_assert((N & (N - 1)) == 0,
+  static_assert(BUFFER_SIZE > 1, "capacity must be > 1");
+  static_assert((BUFFER_SIZE & (BUFFER_SIZE - 1)) == 0,
                 "capacity must be a power of two for optimal performance");
 
   mpmc_lock_ring();
   ~mpmc_lock_ring();
   bool try_enqueue(const T &);
-  bool try_enqueue(T &&);
   bool try_dequeue(T &);
 
   template <typename Titerator>
   std::size_t try_enqueue_batch(Titerator, Titerator);
 
-  static constexpr std::size_t capacity() { return N; }
-  static constexpr bool hasBatch() { return false; }
+  static constexpr std::size_t capacity() { return BUFFER_SIZE; }
 };
 
-template <typename T, std::size_t N> mpmc_lock_ring<T, N>::mpmc_lock_ring() {
-  sem_init(&empty_cells_, 0, N);
+template <typename T, std::size_t BUFFER_SIZE>
+mpmc_lock_ring<T, BUFFER_SIZE>::mpmc_lock_ring() {
+  sem_init(&empty_cells_, 0, BUFFER_SIZE);
   sem_init(&full_cells_, 0, 0);
+  sem_init(&mlck_, 0, 1);
 }
 
-template <typename T, std::size_t N> mpmc_lock_ring<T, N>::~mpmc_lock_ring() {
+template <typename T, std::size_t BUFFER_SIZE>
+mpmc_lock_ring<T, BUFFER_SIZE>::~mpmc_lock_ring() {
   sem_destroy(&empty_cells_);
   sem_destroy(&full_cells_);
+  sem_destroy(&mlck_);
 }
 
-template <typename T, std::size_t N>
-bool mpmc_lock_ring<T, N>::try_enqueue(const T &item) {
-  if (sem_trywait(&empty_cells_)) {
-    return false; // buffer fulls, return immediately to avoid deadlock
-  }
-
-  {
-    std::lock_guard<std::mutex> lkg(mlck_);
-    buf_[tail_] = item;
-    tail_ = (tail_ + 1) & (N - 1);
-  }
+template <typename T, std::size_t BUFFER_SIZE>
+bool mpmc_lock_ring<T, BUFFER_SIZE>::try_enqueue(const T &item) {
+  // if (sem_trywait(&empty_cells_)) {
+  //   return false; // buffer full, return immediately to avoid deadlock
+  // }
+  sem_wait(&empty_cells_);
+  sem_wait(&mlck_);
+  buffer_[tail_] = item;
+  tail_ = (tail_ + 1) & (BUFFER_SIZE - 1);
+  sem_post(&mlck_);
   sem_post(&full_cells_); // notify consumers
   return true;
 }
 
-template <typename T, std::size_t N>
-bool mpmc_lock_ring<T, N>::try_enqueue(T &&item) {
-  if (sem_trywait(&empty_cells_)) {
-    return false;
-  }
-
-  {
-    std::lock_guard<std::mutex> lkg(mlck_);
-    buf_[tail_] = std::move(item);
-    tail_ = (tail_ + 1) & (N - 1);
-  }
-
-  sem_post(&full_cells_);
-  return true;
-}
-
-template <typename T, std::size_t N>
-bool mpmc_lock_ring<T, N>::try_dequeue(T &item) {
-  if (sem_trywait(&full_cells_)) {
-    return false; // buffer empty, return immediately
-  }
-
-  {
-    std::lock_guard<std::mutex> lkg(mlck_);
-    item = buf_[head_];
-    head_ = (head_ + 1) & (N - 1);
-  }
-
+template <typename T, std::size_t BUFFER_SIZE>
+bool mpmc_lock_ring<T, BUFFER_SIZE>::try_dequeue(T &item) {
+  // if (sem_trywait(&full_cells_)) {
+  //   return false; // buffer empty, return immediately
+  // }
+  sem_wait(&full_cells_);
+  sem_wait(&mlck_);
+  item = buffer_[head_];
+  head_ = (head_ + 1) & (BUFFER_SIZE - 1);
+  sem_post(&mlck_);
   sem_post(&empty_cells_); // notify producers of new empty cell
   return true;
 }
 
-template <typename T, std::size_t N>
-template <typename Titerator>
-std::size_t mpmc_lock_ring<T, N>::try_enqueue_batch(Titerator start,
-                                                    Titerator end) {
-  return 0;
-}
-
-#endif // MPMC_LOCK_RING_HPP
+#endif // MPMC_LOCK_RIBUFFER_SIZEG_HPP

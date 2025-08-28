@@ -1,28 +1,23 @@
 /*
  * Attempt of implementing Vyukov MPMC lockfree (non-blocking) bounded buffer
  *
+ * Reference - Dimitry Vyukov (https://www.1024cores.net/home)
  * Author - Sami Al-Jamal
  * Filename - mpmc_ring.hpp
  * */
 #ifndef MPMC_RING_HPP
 #define MPMC_RING_HPP
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cstddef>
-#include <mutex>
+#include <memory>
 #include <utility>
-#include <vector>
 
 #if defined(__cpp_lib_hardware_interference_size)
 constexpr std::size_t CLS = std::hardware_destructive_interference_size;
 #else
 constexpr std::size_t CLS = 64; // x86 arch only
 #endif
-
-template <typename T> struct alignas(CLS) PaddedAtomicU64 {
-  std::atomic<T> v;
-};
 
 /*
  * To prevent "thundering herd" problem from occurring when a
@@ -46,47 +41,61 @@ public:
   void reset() { current = min_delay; }
 };
 
-template <typename T, const std::size_t N> class mpmc_ring {
+template <typename T, const std::size_t BUFFER_SIZE> class mpmc_ring {
 private:
-  static_assert(N > 1, "capacity must be > 1");
-  static_assert((N & (N - 1)) == 0,
+  static_assert(BUFFER_SIZE > 1, "capacity must be > 1");
+  static_assert((BUFFER_SIZE & (BUFFER_SIZE - 1)) == 0,
                 "capacity must be a power of 2 for optimal performance");
 
   /*
-   * Separate payload from atomic variable to avoid cache
-   * invalidation that may occur when attempting to write and read
-   * from both.
+   * Maintaing bounded array implementation, however beware of the fact that
+   * each cell is no longer padded. This is due to my previous ignorance
+   * regarding how the cells will be read and write in a sequential manner; this
+   * implementation follows a FIFO pattern, therefore spatial locality when
+   * reading and writing may prove benefitial.
    *
-   * When seq_ is being updated it may invalidate the cache line
-   * while another is trying to read from payload (if tightly packed).
+   * Placing each on a separete cache line prevents sharing all together, but
+   * this hinders benefits of the contiguous nature of the data structure.
    * */
-  std::array<PaddedAtomicU64<std::size_t>, N>
-      seq_;                  // used to determine if cell within buffer has
-  std::array<T, N> payload_; // been processed or not
+  struct cell_t {
+    std::atomic<std::size_t> seq_;
+    T payload_;
+  };
 
-  PaddedAtomicU64<std::size_t> head_; // consumer tickets
-  PaddedAtomicU64<std::size_t> tail_; // producer tickets
-  std::mutex mx;
+  alignas(CLS) cell_t *buffer_;
+  std::size_t const buffer_mask_;
+  alignas(CLS) std::atomic<std::size_t> enqueue_pos_;
+  alignas(CLS) std::atomic<std::size_t> dequeue_pos_;
 
 public:
   mpmc_ring();
+  ~mpmc_ring();
   bool try_enqueue(const T &);
-  bool try_enqueue(T &&);
   bool try_dequeue(T &);
+
+  mpmc_ring(const mpmc_ring &) = delete;
+  mpmc_ring &operator=(const mpmc_ring &) = delete;
 
   template <typename Titerator>
   std::size_t try_enqueue_batch(Titerator, Titerator);
 
-  static constexpr std::size_t capacity() { return N; }
-  static constexpr bool hasBatch() { return true; }
+  static constexpr std::size_t capacity() { return BUFFER_SIZE; }
 };
 
-template <typename T, const std::size_t N> mpmc_ring<T, N>::mpmc_ring() {
-  for (std::size_t i{}; i < N; ++i)
-    seq_[i].v.store(i, std::memory_order_relaxed);
+template <typename T, const std::size_t BUFFER_SIZE>
+mpmc_ring<T, BUFFER_SIZE>::mpmc_ring()
+    : buffer_(new cell_t[BUFFER_SIZE]), buffer_mask_(BUFFER_SIZE - 1) {
+  for (std::size_t i{}; i < BUFFER_SIZE; ++i) {
+    buffer_[i].seq_.store(i, std::memory_order_relaxed);
+  }
 
-  head_.v.store(0, std::memory_order_relaxed);
-  tail_.v.store(0, std::memory_order_relaxed);
+  enqueue_pos_.store(0, std::memory_order_relaxed);
+  dequeue_pos_.store(0, std::memory_order_relaxed);
+}
+
+template <typename T, const std::size_t BUFFER_SIZE>
+mpmc_ring<T, BUFFER_SIZE>::~mpmc_ring() {
+  delete[] buffer_;
 }
 
 template <typename T, std::size_t N>
@@ -102,85 +111,33 @@ bool mpmc_ring<T, N>::try_enqueue(const T &item) {
    * (3) diff > 0, cell has already been written to by a previous thread
    * */
 
-  std::size_t ticket = tail_.v.load(
-      std::memory_order_relaxed); // producer thread specific ticket identifier
-
-  Exponential_backoff backoff;
+  cell_t *cell;
+  std::size_t pos = enqueue_pos_.load(std::memory_order_relaxed);
 
   while (true) {
-    T &cur_payload =
-        payload_[ticket &
-                 (N - 1)]; // reference to particular cell to be written to
-    PaddedAtomicU64<std::size_t> &cur_seq = seq_[ticket & (N - 1)];
-    std::size_t s = cur_seq.v.load(std::memory_order_acquire);
-    ptrdiff_t diff = static_cast<ptrdiff_t>(s) - static_cast<ptrdiff_t>(ticket);
+    cell = &buffer_[pos & buffer_mask_];
+    std::size_t seq = cell->seq_.load(std::memory_order_acquire);
+
+    intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
 
     if (diff == 0) {
-      if (tail_.v.compare_exchange_weak(ticket, ticket + 1,
-                                        std::memory_order_relaxed,
-                                        std::memory_order_relaxed)) {
-        // Thread owns this slot
-        cur_payload = item;
-        cur_seq.v.store(ticket + 1,
-                        std::memory_order_release); // publish to consumers that
-                                                    // cell is fresh
-        return true;
-      }
-
-      // CAS failing indicates that another thread had used the ticket, refresh
-      // and  try again
-      backoff.wait();
-
-    } else if (diff < 0) {
-      // queue is full; try later
-      return false;
-
-    } else {
-      // refresh ticket; another producer has already used the current ticket
-      ticket = tail_.v.load(std::memory_order_relaxed);
-      backoff.reset();
-    }
-  }
-
-  return false;
-}
-
-template <typename T, std::size_t N>
-bool mpmc_ring<T, N>::try_enqueue(T &&item) {
-  std::size_t ticket = tail_.v.load(std::memory_order_relaxed);
-  Exponential_backoff backoff;
-
-  while (true) {
-    T &cur_payload = payload_[ticket & (N - 1)];
-    PaddedAtomicU64<std::size_t> &cur_seq = seq_[ticket & (N - 1)];
-    std::size_t s = cur_seq.v.load(std::memory_order_acquire);
-    ptrdiff_t diff = static_cast<ptrdiff_t>(s) - static_cast<ptrdiff_t>(ticket);
-
-    if (diff == 0) {
-      if (tail_.v.compare_exchange_weak(ticket, ticket + 1,
-                                        std::memory_order_relaxed,
-                                        std::memory_order_relaxed)) {
-        cur_payload = std::move(item);
-        cur_seq.v.store(ticket + 1, std::memory_order_release);
-
-        return true;
-      }
-
-      backoff.wait();
-
+      if (enqueue_pos_.compare_exchange_weak(pos, pos + 1,
+                                             std::memory_order_relaxed))
+        break;
     } else if (diff < 0) {
       return false;
     } else {
-      ticket = tail_.v.load(std::memory_order_relaxed);
-      backoff.reset();
+      pos = enqueue_pos_.load(std::memory_order_relaxed);
     }
   }
+  cell->payload_ = item;
+  cell->seq_.store(pos + 1, std::memory_order_release);
 
-  return false;
+  return true;
 }
 
-template <typename T, std::size_t N>
-bool mpmc_ring<T, N>::try_dequeue(T &item) {
+template <typename T, std::size_t BUFFER_SIZE>
+bool mpmc_ring<T, BUFFER_SIZE>::try_dequeue(T &item) {
   /* LOGIC:
    * A cell is identified as being "filled" (payload is fresh) if its
    * seq is equivalent to the monotonic ticket loaded from the head_
@@ -191,86 +148,28 @@ bool mpmc_ring<T, N>::try_dequeue(T &item) {
    * (2) diff < 0, cell contains stail data (new write needed)
    * (3) diff > 0, cell has already been consumed (try another cell)
    * */
-
-  std::size_t ticket = head_.v.load(std::memory_order_relaxed);
-
-  Exponential_backoff backoff;
-
-  for (;;) {
-    T &cur_payload = payload_[ticket & (N - 1)];
-    PaddedAtomicU64<std::size_t> &cur_seq = seq_[ticket & (N - 1)];
-    std::size_t s = cur_seq.v.load(std::memory_order_acquire);
-    ptrdiff_t diff =
-        static_cast<ptrdiff_t>(s) - static_cast<ptrdiff_t>(ticket + 1);
+  cell_t *cell;
+  std::size_t pos = dequeue_pos_.load(std::memory_order_relaxed);
+  while (true) {
+    cell = &buffer_[pos & buffer_mask_];
+    std::size_t seq = cell->seq_.load(std::memory_order_acquire);
+    intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
 
     if (diff == 0) {
-      if (head_.v.compare_exchange_weak(ticket, ticket + 1,
-                                        std::memory_order_relaxed,
-                                        std::memory_order_relaxed)) {
-        item = cur_payload;
-        cur_seq.v.store(ticket + N, std::memory_order_release);
-
-        return true;
-      }
-
-      // If CAS failed, another thread already dequed using the current ticket,
-      // retry.
-      backoff.wait();
-
+      if (dequeue_pos_.compare_exchange_weak(pos, pos + 1,
+                                             std::memory_order_relaxed))
+        break;
     } else if (diff < 0) {
-      // still stail
-      return false;
+      return false; // cell empty; no new data has been written by a producer
+                    // yet
     } else {
-      ticket = head_.v.load(std::memory_order_relaxed);
-      backoff.reset();
+      pos = dequeue_pos_.load(std::memory_order_relaxed);
     }
   }
 
-  return false;
-}
+  item = cell->payload_;
+  cell->seq_.store(pos + BUFFER_SIZE, std::memory_order_release);
 
-template <typename T, std::size_t N>
-template <typename Titerator>
-std::size_t mpmc_ring<T, N>::try_enqueue_batch(Titerator start, Titerator end) {
-  std::size_t desired_batch_size = std::distance(start, end);
-  if (desired_batch_size == 0)
-    return 0;
-
-  std::size_t ticket = tail_.v.load(std::memory_order_relaxed);
-
-  Exponential_backoff backoff;
-  for (;;) {
-    const std::size_t head = head_.v.load(std::memory_order_acquire);
-    const std::size_t free_cells = N - (ticket - head);
-    if (free_cells == 0)
-      return 0;
-
-    const std::size_t take = std::min(desired_batch_size, free_cells);
-    if (tail_.v.compare_exchange_weak(ticket, ticket + take,
-                                      std::memory_order_acq_rel,
-                                      std::memory_order_relaxed)) {
-      for (std::size_t i{}; i < take; ++i, ++start) {
-        const std::size_t pos = ticket + i;
-        const std::size_t idx = pos & (N - 1);
-        PaddedAtomicU64<std::size_t> &cell = seq_[idx];
-        T &payload = payload_[idx];
-
-        // Ensure the cell is actually free for this pos.
-        // With correct capacity accounting this should be ready quickly;
-        // if it isn't, something else is wrong.
-        while (cell.v.load(std::memory_order_acquire) != pos) {
-          backoff.wait();
-        }
-        backoff.reset();
-
-        payload = *start;
-        cell.v.store(pos + 1, std::memory_order_release);
-      }
-
-      return take;
-    }
-
-    // lost race; retry with updated ticket
-  }
+  return true;
 }
 #endif // MPMC_RING_HPP
