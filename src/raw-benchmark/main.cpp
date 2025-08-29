@@ -1,6 +1,6 @@
-#include "./mpmc_lock_ring.hpp"
-#include "./mpmc_ring.hpp"
-#include "./performance.hpp"
+#include "../../include/mpmc_lock_ring.hpp"
+#include "../../include/mpmc_ring.hpp"
+#include "../../include/performance.hpp"
 #include <atomic>
 #include <cmath>
 #include <iostream>
@@ -9,7 +9,7 @@
 #include <thread>
 #include <vector>
 
-static constexpr std::size_t MAXN = 1 << 15;
+static constexpr std::size_t MAXN = 1 << 10;
 static constexpr std::size_t N_TRIALS = 50;
 static const int MAX_THREADS = std::thread::hardware_concurrency();
 
@@ -143,6 +143,7 @@ template <typename T> double percent_error(const T a, const T b) {
 
 int main() {
   int nWrites{};
+  char response{};
   std::cout << "Number of writes: ";
   std::cin >> nWrites;
 

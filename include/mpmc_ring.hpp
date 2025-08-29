@@ -10,8 +10,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
-#include <memory>
-#include <utility>
 
 #if defined(__cpp_lib_hardware_interference_size)
 constexpr std::size_t CLS = std::hardware_destructive_interference_size;
@@ -114,6 +112,7 @@ bool mpmc_ring<T, N>::try_enqueue(const T &item) {
   cell_t *cell;
   std::size_t pos = enqueue_pos_.load(std::memory_order_relaxed);
 
+  Exponential_backoff backoff;
   while (true) {
     cell = &buffer_[pos & buffer_mask_];
     std::size_t seq = cell->seq_.load(std::memory_order_acquire);
@@ -124,9 +123,12 @@ bool mpmc_ring<T, N>::try_enqueue(const T &item) {
       if (enqueue_pos_.compare_exchange_weak(pos, pos + 1,
                                              std::memory_order_relaxed))
         break;
+      else
+        backoff.wait();
     } else if (diff < 0) {
       return false;
     } else {
+      backoff.reset();
       pos = enqueue_pos_.load(std::memory_order_relaxed);
     }
   }
@@ -150,6 +152,8 @@ bool mpmc_ring<T, BUFFER_SIZE>::try_dequeue(T &item) {
    * */
   cell_t *cell;
   std::size_t pos = dequeue_pos_.load(std::memory_order_relaxed);
+
+  Exponential_backoff backoff;
   while (true) {
     cell = &buffer_[pos & buffer_mask_];
     std::size_t seq = cell->seq_.load(std::memory_order_acquire);
@@ -159,10 +163,13 @@ bool mpmc_ring<T, BUFFER_SIZE>::try_dequeue(T &item) {
       if (dequeue_pos_.compare_exchange_weak(pos, pos + 1,
                                              std::memory_order_relaxed))
         break;
+      else
+        backoff.wait();
     } else if (diff < 0) {
       return false; // cell empty; no new data has been written by a producer
                     // yet
     } else {
+      backoff.reset();
       pos = dequeue_pos_.load(std::memory_order_relaxed);
     }
   }

@@ -1,4 +1,4 @@
-#include "./performance.hpp"
+#include "../include/performance.hpp"
 
 Timer::Timer() {
   startTimepoint_ = std::chrono::high_resolution_clock::now();
