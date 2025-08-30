@@ -12,9 +12,9 @@ RAW_TARGET := raw_test.out
 APP_TARGET := app_test.out
 
 RAW_SOURCES := ./src/raw-benchmark/main.cpp
-APP_SOURCES := ./src/packet-benchmark/udp_mult_recv.cpp ./src/packet-benchmark/udp_mult_sender.cpp ./src/packet-benchmark/main.cpp
+APP_SOURCES := ./src/packet-benchmark/main.cpp 
 COMMON_SOURCES := ./common/performance.cpp ./common/fix.cpp
-HEADERS := ./include/mpmc_ring.hpp ./include/mpmc_lock_ring.hpp ./include/performance.hpp ./include/fix.hpp
+HEADERS := ./include/mpmc_ring.hpp ./include/mpmc_lock_ring.hpp ./include/performance.hpp ./include/fix.hpp ./include/udp_multicast.hpp
 
 RAW_OBJECTS := $(RAW_SOURCES:./src/raw-benchmark/%.cpp=$(RAW_BUILD_DIR)/%.o) \
                $(COMMON_SOURCES:./common/%.cpp=$(RAW_BUILD_DIR)/%.o)
