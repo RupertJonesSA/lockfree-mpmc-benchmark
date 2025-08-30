@@ -2,6 +2,7 @@
 #define FIX_HPP
 
 #include <array>
+#include <charconv>
 #include <iomanip>
 #include <random>
 #include <string>
@@ -9,13 +10,21 @@
 
 class Fix_engine {
 public:
+  struct Instrument_stats {
+    std::string_view sym;
+    uint64_t qty;
+    double px;
+    uint8_t side; // 2 - sell | 1 - buy
+  };
+
   Fix_engine() = default;
   Fix_engine(const Fix_engine &) = delete;
   Fix_engine &operator=(const Fix_engine &) = delete;
 
   static void set_thread_seed(uint64_t seed);
   std::string get_fix_message() const;
-  std::string interpret_fix_message(char *msg, std::size_t len);
+  Instrument_stats interpret_fix_message(char *msg, std::size_t len);
+  static constexpr std::size_t symbol_count() { return symbols_.size(); }
 
 private:
   // Data
@@ -48,9 +57,6 @@ private:
   static TLS &tls(); // thread_local instance
 
   static std::string checksum_(std::string_view msg); // FIX checksum (3 digits)
-  void
-  parse_fix_message_(const char *data, std::size_t len,
-                     std::array<std::string_view, max_packet_len_> &parsed);
 };
 
 #endif // FIX_HPP

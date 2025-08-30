@@ -42,95 +42,54 @@ std::string Fix_engine::get_fix_message() const {
   return oss.str();
 }
 
-std::string Fix_engine::interpret_fix_message(char *msg, std::size_t len) {
-  std::array<std::string_view, max_packet_len_> parsed_fix;
-  parse_fix_message_(msg, len, parsed_fix);
+Fix_engine::Instrument_stats
+Fix_engine::interpret_fix_message(char *msg, std::size_t len) {
+  Instrument_stats relevant_info; // sym, qty, px, side
 
-  std::ostringstream oss;
-
-  for (std::size_t tag{}; tag < max_packet_len_; ++tag) {
-    if (parsed_fix[tag].empty())
-      continue;
-
-    switch (tag) {
-    case 8:
-      oss << "FIX Version: " << parsed_fix[tag] << "\n";
-      break;
-    case 35:
-      oss << "Message Type: " << parsed_fix[tag] << "\n";
-      break;
-    case 49:
-      oss << "SenderCompID: " << parsed_fix[tag] << "\n";
-      break;
-    case 56:
-      oss << "TargetCompID: " << parsed_fix[tag] << "\n";
-      break;
-    case 55:
-      oss << "Symbol: " << parsed_fix[tag] << "\n";
-      break;
-    case 54:
-      oss << "Side: " << (parsed_fix[tag] == "1" ? "Buy" : "Sell") << "\n";
-      break;
-    case 38:
-      oss << "Order Quantity: " << parsed_fix[tag] << "\n";
-      break;
-    case 44:
-      oss << "Price: " << parsed_fix[tag] << "\n";
-      break;
-    case 10:
-      oss << "Checksum: " << parsed_fix[tag] << "\n";
-      break;
-    case 40:
-      oss << "OrdType: " << parsed_fix[tag] << "\n";
-      break;
-    case 11:
-      oss << "ClOrdID: " << parsed_fix[tag] << "\n";
-      break;
-    case 34:
-      oss << "MsgSeqNum: " << parsed_fix[tag] << "\n";
-      break;
-    default:
-      break;
-    }
-  }
-
-  return oss.str();
-}
-
-void Fix_engine::parse_fix_message_(
-    const char *data, std::size_t len,
-    std::array<std::string_view, max_packet_len_> &parsed_fix) {
+  enum relevant_tag { SYM = 55, SIDE = 54, QTY = 38, PX = 44 };
 
   std::size_t i{0};
 
   while (i < len) {
     // find '='
     std::size_t eq = i;
-    while (eq < len && data[eq] != '=')
+    while (eq < len && msg[eq] != '=')
       ++eq;
     if (eq == len)
       break; // malformed
 
     // parse tag as int
-    int tag{0};
-    for (std::size_t j = i; j < eq; ++j) {
-      char c = data[j];
-      if (c < '0' || c > '9') {
-        tag = -1;
-        break;
-      }
-      tag = tag * 10 + (c - '0');
-    }
+    int tag{};
+    std::from_chars(msg + i, msg + eq, tag);
 
     // find '|'
     std::size_t end = eq + 1;
-    while (end < len && data[end] != '|')
+    while (end < len && msg[end] != '|')
       ++end;
 
-    if (tag > 0 && tag < max_packet_len_) {
-      parsed_fix[tag] = std::string_view(data + eq + 1, end - (eq + 1));
+    switch (tag) {
+    case SYM:
+      relevant_info.sym = std::string_view(msg + eq + 1, end - (eq + 1));
+      break;
+
+    case SIDE:
+      std::from_chars(msg + eq + 1, msg + end, relevant_info.side);
+      break;
+
+    case QTY:
+      std::from_chars(msg + eq + 1, msg + end, relevant_info.qty);
+      break;
+
+    case PX:
+      std::from_chars(msg + eq + 1, msg + end, relevant_info.px);
+      break;
+
+    default:
+      break;
     }
 
     i = end + 1;
   }
+
+  return relevant_info;
 }
