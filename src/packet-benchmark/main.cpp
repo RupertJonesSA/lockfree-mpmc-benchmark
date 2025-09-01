@@ -2,13 +2,16 @@
 #include <atomic>
 #include <bit>
 #include <csignal>
+#include <cstdlib>
+#include <iomanip>
 #include <limits>
 #include <unordered_map>
 
 static const std::size_t MAX_THREADS = std::thread::hardware_concurrency();
-static const std::size_t MAX_MCGRP = 7;
+static constexpr uint16_t SIMULATION_TIME_S = 60; // in seconds
 
 alignas(CLS) std::atomic<std::size_t> consumer_fails;
+alignas(CLS) std::atomic<uint64_t> successfully_processed;
 alignas(CLS)
     std::atomic<uint64_t> emitted_window_id; // previous 100ms window emitted
 alignas(CLS) std::atomic<uint64_t> cur_shared_window_id; // current 100ms window
@@ -16,14 +19,20 @@ alignas(CLS) std::atomic<uint64_t> cur_shared_window_id; // current 100ms window
 alignas(CLS) std::atomic_flag emitter_busy = ATOMIC_FLAG_INIT;
 std::mutex shard_lock;
 
-static std::array<Multicast_grp, MAX_MCGRP> multicast_groups{
-    {{"224.0.0.1", "3000"},
-     {"224.0.1.0", "3001"},
-     {"224.1.0.0", "3002"},
-     {"224.0.1.1", "3003"},
-     {"224.1.1.1", "3004"},
-     {"224.1.1.2", "3005"},
-     {"224.1.2.2", "3006"}}};
+static std::array<Multicast_grp, 14> multicast_groups{{{"224.0.0.1", "3000"},
+                                                       {"224.0.1.0", "3001"},
+                                                       {"224.1.0.0", "3002"},
+                                                       {"224.0.1.1", "3003"},
+                                                       {"224.1.1.1", "3004"},
+                                                       {"224.1.1.2", "3005"},
+                                                       {"224.1.2.2", "3006"},
+                                                       {"224.2.1.1", "3007"},
+                                                       {"224.2.1.2", "3008"},
+                                                       {"224.2.2.1", "3009"},
+                                                       {"224.2.2.2", "3010"},
+                                                       {"224.3.0.0", "3011"},
+                                                       {"224.3.0.1", "3012"},
+                                                       {"224.3.1.0", "3013"}}};
 static Fix_engine feed;
 
 struct Accum {
@@ -166,38 +175,40 @@ static void emit_symbol_row(uint64_t ts_start_ns, uint64_t ts_end_ns,
             << recv_count << ',' << parse_errs << ',' << partial << '\n';
 
   // compact human-readable line for stdout (optional)
-  std::cout << '[' << window_id << "][" << sym << "] "
-            << "qty(b/s)=" << a.buy_qty << '/' << a.sell_qty
-            << " notl(b/s)=" << a.buy_notional << '/' << a.sell_notional
-            << " vwap(b/s)=" << (double)buy_vwap << '/' << (double)sell_vwap
-            << " imb=" << imb << " qwait_us(p50/p90/p99/max)=" << q_p50 << '/'
-            << q_p90 << '/' << q_p99 << '/' << q_max << " n=" << q_n
-            << " drops_full=" << drops_full
-            << " drops_oversize=" << drops_oversize << " recv=" << recv_count
-            << " parse_errs=" << parse_errs << (partial ? " PARTIAL" : "")
-            << '\n';
+  // std::cout << '[' << window_id << "][" << sym << "] "
+  //           << "qty(b/s)=" << a.buy_qty << '/' << a.sell_qty
+  //           << " notl(b/s)=" << a.buy_notional << '/' << a.sell_notional
+  //           << " vwap(b/s)=" << (double)buy_vwap << '/' << (double)sell_vwap
+  //           << " imb=" << imb << " qwait_us(p50/p90/p99/max)=" << q_p50 <<
+  //           '/'
+  //           << q_p90 << '/' << q_p99 << '/' << q_max << " n=" << q_n
+  //           << " drops_full=" << drops_full
+  //           << " drops_oversize=" << drops_oversize << " recv=" << recv_count
+  //           << " parse_errs=" << parse_errs << (partial ? " PARTIAL" : "")
+  //           << '\n';
 }
 
 void msg_processor() {
   Payload_t rx_msg;
   std::size_t batch_cnt = 0;
-  std::size_t local_fail = 0;
+  std::size_t local_processed = 0;
 
   uint64_t window_id{0}, prev_window_id{0};
   Shard shard;
   shard.reserve(Fix_engine::symbol_count());
 
-  Histo64 local_qwait; // per-worker
+  Histo64 local_qwait; // distribution of latency enqueue->dequeue
 
-  while (running) {
+  while (true) {
     while (!(msg_ring_buffer.try_dequeue(rx_msg))) {
-      local_fail++;
-      if (!running)
-        break;
+      if (!running.load(std::memory_order_relaxed)) {
+        goto End;
+      }
     }
 
     // qwait observe
     uint64_t q_ns = now_ns() - rx_msg.rx_ns; // enqueue->dequeue time
+
     local_qwait.observe_ns(q_ns);
     window_id = rx_msg.rx_ns / 100'000'000ull; // window of 100 ms
 
@@ -246,8 +257,11 @@ void msg_processor() {
       a.sell_qty += qty;
       a.sell_notional += (long double)qty * px;
     }
+
+    local_processed++;
   }
 
+End:
   // final push of this worker's shard + qwait upon exit
   {
     std::lock_guard<std::mutex> lock(shard_lock);
@@ -263,6 +277,8 @@ void msg_processor() {
     }
     histo_merge(local_qwait, active_qwait);
   }
+
+  successfully_processed.fetch_add(local_processed, std::memory_order_relaxed);
 }
 
 static uint64_t prev_full_drops{0}, prev_oversize_drops{0}, prev_enqueued{0},
@@ -287,49 +303,81 @@ static inline void snapshot_counters(uint64_t &drops_full,
   prev_parse_errs = pe;
 }
 
-std::fstream stats_out;
+static void request_stop_and_unblock_io() {
+  running.store(false, std::memory_order_release);
+
+  // wake any blocking syscalls in udp receivers/senders
+  for (int fd : all_udp_fds) {
+    shutdown(fd, SHUT_RD);
+  }
+}
+
+static void handle_signal_local(int) { request_stop_and_unblock_io(); }
+
 std::fstream receiver_stream;
 std::fstream sender_stream;
+std::fstream stats_out;
 
 int main() {
+  std::string stats_path;
+  std::cout << "File path to write results... ";
+  std::cin >> stats_path;
 
   std::cout << "Running UDP FIX MPMC Data Pipeline with " << MAX_THREADS
             << " threads...\n";
 
   open_logs(); // name says it all
+  stats_out.open(stats_path, fstream_mode);
   // Just gonna evenly distribute all threads between UDP senders,
   // UDP receivers, and message processors
 
-  std::size_t nThreads = MAX_THREADS;
-  std::size_t udp_recv_threads = MAX_MCGRP;
-  std::size_t udp_send_threads = 1;
+  ssize_t nThreads = MAX_THREADS;
+  ssize_t udp_recv_threads = CUR_MCGRP;
+  ssize_t udp_send_threads = CUR_MCGRP;
   nThreads -= udp_recv_threads + udp_send_threads;
-  std::size_t message_proc_threads = nThreads;
+  ssize_t message_proc_threads = nThreads;
   nThreads -= message_proc_threads;
 
-  std::thread sender(udp_sender<MAX_MCGRP>, std::ref(multicast_groups));
-  sender.detach();
+  if (message_proc_threads < 1) {
+    std::cout << "Insufficient amount of threads...\n";
+    return 1;
+  }
+
+  std::cout << "THREAD DISTRIBUTION:\n";
+  std::cout << "     UDP RECEIVERS=" << udp_recv_threads << "\n";
+  std::cout << "     UDP SENDERS=" << udp_send_threads << "\n";
+  std::cout << "     MESSAGE PROCESSORS=" << message_proc_threads << "\n";
+
+  std::vector<std::thread> threads;
+
+  for (int i{}; i < udp_send_threads; ++i) {
+    threads.emplace_back(udp_sender, multicast_groups[i], i);
+  }
 
   for (int i{}; i < udp_recv_threads; ++i) {
-    std::thread recv(udp_receiver, multicast_groups[i]);
-    recv.detach();
+    threads.emplace_back(udp_receiver, multicast_groups[i],
+                         i + udp_send_threads);
   }
 
   for (int i{}; i < message_proc_threads; ++i) {
-    std::thread proc(msg_processor);
-    proc.detach();
+    threads.emplace_back(msg_processor);
   }
 
   emit_csv_header_once();
 
   // install signal handler to flip `running=false` (declared in
   // udp_multicast.cpp)
-  std::signal(SIGINT, handle_signal);
-  std::signal(SIGTSTP, handle_signal);
-  std::signal(SIGTERM, handle_signal);
+  std::signal(SIGPIPE, SIG_IGN);
+  std::signal(SIGINT, handle_signal_local);
+  std::signal(SIGTSTP, handle_signal_local);
+  std::signal(SIGTERM, handle_signal_local);
 
+  auto t0 = std::chrono::steady_clock::now(); // run simulation for fixed time
+
+  uint64_t avg_dequeue_ns = 0;
+  std::size_t idx = 0;
   uint64_t win_ns = 100'000'000ull;
-  while (running) {
+  while (running.load(std::memory_order_acquire)) {
     uint64_t cur = cur_shared_window_id.load(std::memory_order_acquire);
     uint64_t last = emitted_window_id.load(std::memory_order_acquire);
     if (cur > last) {
@@ -360,11 +408,28 @@ int main() {
         emit_symbol_row(ts_start_ns, ts_end_ns, W, sym, a, p50, p90, p99, pmax,
                         qn, drops_full, drops_oversize, recv_count, parse_errs,
                         /*partial=*/0);
+        avg_dequeue_ns = ((avg_dequeue_ns * idx) + (p50)) / (idx + 1);
       }
-
+      idx++;
       emitted_window_id.store(W, std::memory_order_release);
       stats_out.flush();
     }
+    auto now = std::chrono::steady_clock::now();
+    if (now - t0 >= std::chrono::seconds(SIMULATION_TIME_S)) {
+      request_stop_and_unblock_io();
+
+      std::cout << "Waiting for threads...\n";
+      for (std::thread &th : threads) {
+        if (th.joinable()) {
+          th.join();
+        }
+      }
+
+      std::cout << "Threads finished...\n";
+
+      break;
+    }
+
     // light pause to avoid hot spinning the CPU if nothing to emit
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
@@ -402,4 +467,19 @@ int main() {
     }
     stats_out.flush();
   }
+
+  double throughput = successfully_processed.load(std::memory_order_relaxed) *
+                      1.0f / SIMULATION_TIME_S;
+
+  std::cout
+      << "$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$\n";
+  std::cout << SIMULATION_TIME_S << " SECOND STATS LINE\n";
+  std::cout << "    AVERAGE DEQUEUE LATENCY: " << avg_dequeue_ns << "ns\n";
+  std::cout << "    TOTAL PROCESSED: " << successfully_processed
+            << " FIX messages\n";
+  std::cout << "    THROUGHPUT (msg/s): " << throughput << "\n";
+
+  receiver_stream.close();
+  sender_stream.close();
+  stats_out.close();
 }

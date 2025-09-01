@@ -32,9 +32,6 @@ public:
   bool try_enqueue(const T &);
   bool try_dequeue(T &);
 
-  template <typename Titerator>
-  std::size_t try_enqueue_batch(Titerator, Titerator);
-
   static constexpr std::size_t capacity() { return BUFFER_SIZE; }
 };
 
@@ -54,10 +51,9 @@ mpmc_lock_ring<T, BUFFER_SIZE>::~mpmc_lock_ring() {
 
 template <typename T, std::size_t BUFFER_SIZE>
 bool mpmc_lock_ring<T, BUFFER_SIZE>::try_enqueue(const T &item) {
-  // if (sem_trywait(&empty_cells_)) {
-  //   return false; // buffer full, return immediately to avoid deadlock
-  // }
-  sem_wait(&empty_cells_);
+  if (sem_trywait(&empty_cells_)) {
+    return false; // buffer full, return immediately to avoid deadlock
+  }
   sem_wait(&mlck_);
   buffer_[tail_] = item;
   tail_ = (tail_ + 1) & (BUFFER_SIZE - 1);
@@ -68,10 +64,9 @@ bool mpmc_lock_ring<T, BUFFER_SIZE>::try_enqueue(const T &item) {
 
 template <typename T, std::size_t BUFFER_SIZE>
 bool mpmc_lock_ring<T, BUFFER_SIZE>::try_dequeue(T &item) {
-  // if (sem_trywait(&full_cells_)) {
-  //   return false; // buffer empty, return immediately
-  // }
-  sem_wait(&full_cells_);
+  if (sem_trywait(&full_cells_)) {
+    return false; // buffer empty, return immediately
+  }
   sem_wait(&mlck_);
   item = buffer_[head_];
   head_ = (head_ + 1) & (BUFFER_SIZE - 1);

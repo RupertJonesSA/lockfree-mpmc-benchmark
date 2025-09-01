@@ -74,9 +74,6 @@ public:
   mpmc_ring(const mpmc_ring &) = delete;
   mpmc_ring &operator=(const mpmc_ring &) = delete;
 
-  template <typename Titerator>
-  std::size_t try_enqueue_batch(Titerator, Titerator);
-
   static constexpr std::size_t capacity() { return BUFFER_SIZE; }
 };
 
@@ -96,8 +93,8 @@ mpmc_ring<T, BUFFER_SIZE>::~mpmc_ring() {
   delete[] buffer_;
 }
 
-template <typename T, std::size_t N>
-bool mpmc_ring<T, N>::try_enqueue(const T &item) {
+template <typename T, const std::size_t BUFFER_SIZE>
+bool mpmc_ring<T, BUFFER_SIZE>::try_enqueue(const T &item) {
   /* LOGIC:
    * A cell is identified as being "empty" (payload has been read already) if
    * its seq is equivalent to the monotonic ticket loaded from the tail_
@@ -138,7 +135,7 @@ bool mpmc_ring<T, N>::try_enqueue(const T &item) {
   return true;
 }
 
-template <typename T, std::size_t BUFFER_SIZE>
+template <typename T, const std::size_t BUFFER_SIZE>
 bool mpmc_ring<T, BUFFER_SIZE>::try_dequeue(T &item) {
   /* LOGIC:
    * A cell is identified as being "filled" (payload is fresh) if its

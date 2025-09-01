@@ -24,9 +24,10 @@
 
 namespace fs = std::filesystem;
 
-static constexpr uint64_t SEED = 1097;
-static constexpr std::size_t MAX_RX = 1 << 8;
-static constexpr std::size_t MAXN = 1 << 10;
+constexpr uint64_t SEED = 1097;
+constexpr std::size_t MAX_RX = 1 << 8;
+constexpr std::size_t MAXN = 1 << 15;
+constexpr std::size_t CUR_MCGRP = 7;
 
 struct Multicast_grp {
   std::string ip;
@@ -38,14 +39,15 @@ struct Multicast_grp {
  * message is <= MAXN to avoid truncating important info.
  * */
 template <std::size_t K> struct Msg {
-  uint64_t rx_ns; // from recv to fully processed;
+  uint64_t rx_ns; // timestamp for when received
   uint16_t len;   // payload length (<= MAXN)
   uint16_t flags; // spare
   char data[K];   // payload bytes
 };
 
 using Payload_t = Msg<MAX_RX>;
-using Buffer_t = mpmc_lock_ring<Payload_t, MAXN>;
+// using Buffer_t = mpmc_lock_ring<Payload_t, MAXN>;
+using Buffer_t = mpmc_ring<Payload_t, MAXN>;
 
 /* Global mutex for synchronizing console output */
 std::mutex sender_io_mutex, receiver_io_mutex;
@@ -53,7 +55,6 @@ std::mutex sender_io_mutex, receiver_io_mutex;
 /* Logging file paths as well as static stream objects */
 static constexpr std::string_view receiver_log_path = "./log/received.txt";
 static constexpr std::string_view sender_log_path = "./log/sent.txt";
-static constexpr std::string_view fix_log_path = "./log/microstats.txt";
 
 static constexpr std::ios_base::openmode fstream_mode =
     std::fstream::out | std::fstream::trunc;
@@ -70,10 +71,15 @@ alignas(
                                                   // alloted size (MAX_RX)
 alignas(CLS) std::atomic<std::size_t> enqueued;
 
-static Buffer_t msg_ring_buffer;
+inline Buffer_t msg_ring_buffer;
+
+std::array<int, CUR_MCGRP * 2> all_udp_fds;
 
 void handle_signal(int signal) {
   running.store(false, std::memory_order_release);
+  for (int fd : all_udp_fds) {
+    shutdown(fd, SHUT_RD); // unblocks
+  }
 }
 
 inline uint64_t now_ns() {
@@ -104,17 +110,16 @@ static void open_logs() {
 
   receiver_stream.open(receiver_log_path.data(), fstream_mode);
   sender_stream.open(sender_log_path.data(), fstream_mode);
-  stats_out.open(fix_log_path.data(), fstream_mode);
 
-  if (!receiver_stream.is_open() || !sender_stream.is_open() ||
-      !stats_out.is_open()) {
+  if (!receiver_stream.is_open() || !sender_stream.is_open()) {
     std::fprintf(stderr,
                  "ERROR: failed to open receiver/sender logs (cwd=%s)\n",
                  fs::current_path().string().c_str());
     std::abort();
   }
 }
-void *udp_receiver(Multicast_grp info) {
+
+void *udp_receiver(Multicast_grp info, int id) {
   /* added to prevent threads for sending interleaving messages */
   std::stringstream oss;
   oss << "Establishing connection to multicast group " << info.ip << " on port "
@@ -128,6 +133,8 @@ void *udp_receiver(Multicast_grp info) {
     perror("Failed to create socket");
     return nullptr;
   }
+
+  all_udp_fds[id] = sockfd;
 
   oss << "OK: created socket for multicast group.\n";
   writeToFile(oss, receiver_stream, receiver_io_mutex);
@@ -166,125 +173,134 @@ void *udp_receiver(Multicast_grp info) {
   char msg[MAX_RX];
   ssize_t bytes_recv{};
 
-  /* Object to parse and interpret FIX packets */
-  Fix_engine feed;
-
   oss << "=============================================\n";
   writeToFile(oss, receiver_stream, receiver_io_mutex);
 
-  while (running.load(std::memory_order_acquire)) {
+  while (running.load(std::memory_order_relaxed)) {
     bytes_recv = recvfrom(sockfd, msg, MAX_RX - 1, 0, NULL, NULL);
 
-    // Interrupted by signal
-    if (errno == EINTR)
-      break;
-
+    // Check if we should exit due to shutdown or error
     if (bytes_recv < 0) {
-      oss << "Error receiving packet from multicast sender";
-      writeToFile(oss, receiver_stream, receiver_io_mutex);
-      continue;
+      // Save errno immediately as it can be overwritten
+      int saved_errno = errno;
+
+      // Check if we're shutting down
+      if (!running.load(std::memory_order_relaxed)) {
+        break;
+      }
+
+      // Handle specific errors
+      if (saved_errno == EINTR || saved_errno == EBADF) {
+        // Socket was shut down or interrupted
+        break;
+      } else if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) {
+        // Timeout occurred, just continue to check running flag
+        continue;
+      } else {
+        oss << "Error receiving packet from multicast sender: "
+            << strerror(saved_errno) << "\n";
+        writeToFile(oss, receiver_stream, receiver_io_mutex);
+        continue;
+      }
     } else if (bytes_recv == 0) {
       oss << "Multicast sender disconnected.\n";
       writeToFile(oss, receiver_stream, receiver_io_mutex);
-    }
-
-    msg[bytes_recv] = '\0';
-    if (bytes_recv > MAX_RX) {
-      oversize_drops++;
-    }
-
-    Msg<MAX_RX> payload_preprocess{now_ns(), static_cast<uint16_t>(bytes_recv),
-                                   0};
-    memcpy(payload_preprocess.data, msg, bytes_recv);
-    if (!msg_ring_buffer.try_enqueue(payload_preprocess)) {
-      full_drops++;
+      continue; // Continue instead of falling through
     } else {
-      enqueued++;
+      // Process the received message
+      msg[bytes_recv] = '\0';
+
+      if (bytes_recv > MAX_RX) {
+        oversize_drops.fetch_add(1, std::memory_order_relaxed);
+        continue; // Don't process oversized messages
+      }
+
+      Msg<MAX_RX> payload_preprocess{now_ns(),
+                                     static_cast<uint16_t>(bytes_recv), 0};
+      memcpy(payload_preprocess.data, msg, bytes_recv);
+
+      if (!msg_ring_buffer.try_enqueue(payload_preprocess)) {
+        full_drops.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        enqueued.fetch_add(1, std::memory_order_relaxed);
+      }
     }
   }
 
   close(sockfd);
 
-  oss << "Closing mutlicast receiver for group " << info.ip << " on port "
+  oss << "Closing multicast receiver for group " << info.ip << " on port "
       << info.port << ".\n";
   writeToFile(oss, receiver_stream, receiver_io_mutex);
+  receiver_stream.flush();
 
   return nullptr;
 }
 
-template <std::size_t N_GRPS>
-int udp_sender(std::array<Multicast_grp, N_GRPS> &multicast_grps) {
+int udp_sender(Multicast_grp multicast_grp, int id) {
   int sendfd{};
   ssize_t bytes_sent{};
-  std::array<struct sockaddr_in, N_GRPS> out_addrs;
+  struct sockaddr_in out_addr;
   char ip_present[INET_ADDRSTRLEN];
   std::string msg;
   std::stringstream oss;
-
-  // std::chrono::milliseconds delay(10);
 
   if ((sendfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
     perror("socket");
     return 1;
   }
 
+  all_udp_fds[id] = sendfd;
+
   oss << "OK: Created sender socket.\n";
   writeToFile(oss, sender_stream, sender_io_mutex);
 
-  /* Parse IP:Port pairs from `multicast_grps` */
-  std::size_t idx = 0;
-  for (const auto &[ip, port] : multicast_grps) {
-    struct sockaddr_in out_addr;
-    memset(&out_addr, 0, sizeof(struct sockaddr_in));
-    out_addr.sin_port =
-        htons(std::stoi(port));    // changes byte order to big endian
-    out_addr.sin_family = AF_INET; // IPv4
-    inet_pton(AF_INET, ip.data(), &(out_addr.sin_addr));
+  const auto &[ip, port] = multicast_grp;
+  memset(&out_addr, 0, sizeof(struct sockaddr_in));
+  out_addr.sin_port = htons(std::stoi(port));
+  out_addr.sin_family = AF_INET;
+  inet_pton(AF_INET, ip.data(), &(out_addr.sin_addr));
+  oss << "Configured multicast group " << ip << " on port " << port << "\n";
+  writeToFile(oss, sender_stream, sender_io_mutex);
 
-    out_addrs[idx++] = out_addr;
-
-    oss << "Configured multicast group " << ip << " on port " << port << "\n";
-    writeToFile(oss, sender_stream, sender_io_mutex);
-  }
-
-  oss << "Sending packets to multicast groups...\n\n";
+  oss << "Sending packets to multicast group...\n\n";
   writeToFile(oss, sender_stream, sender_io_mutex);
 
   /* Object to randomly generate a subset of FIX messages */
   Fix_engine feed;
   feed.set_thread_seed(SEED);
 
-  while (running.load(std::memory_order_acquire)) {
+  while (running.load(std::memory_order_relaxed)) {
     msg = feed.get_fix_message();
-    oss << "Pending (" << strlen(msg.c_str()) << " bytes):\n" << msg << "\n";
-    writeToFile(oss, sender_stream, sender_io_mutex);
-    for (std::size_t i = 0; i < out_addrs.size(); ++i) {
-      bytes_sent =
-          sendto(sendfd, msg.c_str(), strlen(msg.c_str()), 0,
-                 (struct sockaddr *)&out_addrs[i], sizeof(out_addrs[i]));
+    // oss << "Pending (" << strlen(msg.c_str()) << " bytes):\n" << msg << "\n";
+    // writeToFile(oss, sender_stream, sender_io_mutex);
 
-      if (bytes_sent < 0) {
-        if (errno == EINTR)
-          break;
-        perror("sendto");
-        oss << "    ERROR: Failed to send.\n";
-        writeToFile(oss, sender_stream, sender_io_mutex);
-        continue;
-      }
+    bytes_sent = sendto(sendfd, msg.c_str(), strlen(msg.c_str()), 0,
+                        (struct sockaddr *)&out_addr, sizeof(out_addr));
+    if (errno == EINTR)
+      break;
 
-      memset(&ip_present, 0, INET_ADDRSTRLEN);
-      inet_ntop(AF_INET, &(out_addrs[i].sin_addr), ip_present, INET_ADDRSTRLEN);
+    if (bytes_sent < 0) {
 
-      oss << "   OK: Sent (" << bytes_sent << " bytes) to " << ip_present << ":"
-          << ntohs(out_addrs[i].sin_port) << ".\n";
+      perror("sendto");
+      oss << "    ERROR: Failed to send.\n";
       writeToFile(oss, sender_stream, sender_io_mutex);
+      continue;
     }
-    // std::this_thread::sleep_for(delay);
+
+    // memset(&ip_present, 0, INET_ADDRSTRLEN);
+    // inet_ntop(AF_INET, &(out_addr.sin_addr), ip_present, INET_ADDRSTRLEN);
+
+    // oss << "   OK: Sent (" << bytes_sent << " bytes) to " << ip_present <<
+    // ":"
+    //     << ntohs(out_addrs[i].sin_port) << ".\n";
+    // writeToFile(oss, sender_stream, sender_io_mutex);
   }
 
   close(sendfd);
   oss << "OK: Closed UDP multicast sender application.\n";
   writeToFile(oss, sender_stream, sender_io_mutex);
+  sender_stream.flush();
 
   return 0;
 }
