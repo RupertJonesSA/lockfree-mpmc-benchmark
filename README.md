@@ -124,6 +124,7 @@ to me being unaware of other complex memory principles in modern computer arcite
   <img src="plots/p90_vs_cur_lockfree_cap32768.png" width="400"/>
   <img src="plots/p90_vs_cur_lock_cap32768.png" width="400"/>
 </p>
+
 ### Speedup ratio
 <p float="left">
   <img src="plots/speedup_lockfree_over_lock_by_cur.png" width="400"/>
@@ -186,3 +187,4 @@ These were incredibly helpful for me when learning about C++ multithreading and 
 - https://www.1024cores.net/home/lock-free-algorithms/introduction (Dmitry Vyukov blog page; Google researcher who is a veteran in the field)
 - https://pages.cs.wisc.edu/~remzi/OSTEP/ (Free OS textbook that is a fantastic reference book for topics involving concurrency)
 - https://www.bogotobogo.com/cplusplus/files/CplusplusConcurrencyInAction_PracticalMultithreading.pdf (Goes over EVERYTHING C++ specific. Extermely detailed and thorough examination of C++ constructs involving multithreading since C++11)
+
