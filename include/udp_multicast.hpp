@@ -24,10 +24,23 @@
 
 namespace fs = std::filesystem;
 
-constexpr uint64_t SEED = 1097;
-constexpr std::size_t MAX_RX = 1 << 8;
-constexpr std::size_t MAXN = 1 << 15;
-constexpr std::size_t CUR_MCGRP = 7;
+#ifndef CUR_MCGRP
+#define CUR_MCGRP 7
+#endif
+
+#ifndef MAX_RX
+#define MAX_RX (1 << 8)
+#endif
+
+#ifndef MAXN
+#define MAXN (1 << 15)
+#endif
+
+#ifndef SEED_OVERRIDE
+#define SEED_OVERRIDE 1097ull
+#endif
+
+constexpr uint64_t RNG_SEED = SEED_OVERRIDE;
 
 struct Multicast_grp {
   std::string ip;
@@ -46,8 +59,11 @@ template <std::size_t K> struct Msg {
 };
 
 using Payload_t = Msg<MAX_RX>;
-// using Buffer_t = mpmc_lock_ring<Payload_t, MAXN>;
+#if defined(USE_LOCK)
+using Buffer_t = mpmc_lock_ring<Payload_t, MAXN>;
+#else
 using Buffer_t = mpmc_ring<Payload_t, MAXN>;
+#endif
 
 /* Global mutex for synchronizing console output */
 std::mutex sender_io_mutex, receiver_io_mutex;
@@ -261,7 +277,7 @@ int udp_sender(Multicast_grp multicast_grp, int id) {
 
   /* Object to randomly generate a subset of FIX messages */
   Fix_engine feed;
-  feed.set_thread_seed(SEED);
+  feed.set_thread_seed(RNG_SEED);
 
   while (running.load(std::memory_order_relaxed)) {
     msg = feed.get_fix_message();

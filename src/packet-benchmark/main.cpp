@@ -8,7 +8,9 @@
 #include <unordered_map>
 
 static const std::size_t MAX_THREADS = std::thread::hardware_concurrency();
-static constexpr uint16_t SIMULATION_TIME_S = 30; // in seconds
+#ifndef SIMULATION_TIME_S
+#define SIMULATION_TIME_S 30
+#endif // in seconds
 
 alignas(CLS) std::atomic<std::size_t> consumer_fails;
 alignas(CLS) std::atomic<uint64_t> successfully_processed;
@@ -141,8 +143,13 @@ static inline void histo_percentiles(const Histo64 &h, uint64_t &p50,
 static void emit_csv_header_once(ssize_t recv, ssize_t send, ssize_t msg_proc) {
   static std::once_flag once;
   std::call_once(once, [recv, send, msg_proc] {
-    stats_out << "impl,lockfree\n"
-              << "threads, udp_recv=" << recv << ",udp_send=" << send
+#ifdef USE_LOCK
+    stats_out << "impl,lock\n";
+#else 
+    stats_out << "impl,lockfree\n";
+#endif
+
+    stats_out << "threads, udp_recv=" << recv << ",udp_send=" << send
               << ",msg_proc=" << msg_proc << "\n"
               << "host, i7-12650H" << "\n"
               << "build, O3-march=native\n"
