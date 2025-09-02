@@ -89,6 +89,7 @@ Per row/“window” (across all active symbols in that window), the CSV (`./res
 
 **Run duration** is **inferred** per trial as: `duration_s = (max(ts_end_ns)) - min(ts_start_ns)) / 1e9`
 ### 5) Aggregation (Trial → Figure)
+
 `analyze_trials.py` ingests all `results/raw/*.csv` and produces per-trial rows and plots:
 
 **Per-trial summary (one row per raw file):**
@@ -119,12 +120,15 @@ Here are some interesting plots I found when I ran the scripts. To be fair I am 
 to me being unaware of other complex memory principles in modern computer arcitecture (e.g., NUMA, core affinity, etc.).
 
 ### Latency tail growth
-![p90 latency vs. Concurrency (lock, cap=32768)](plots/p90_vs_cur_lock_cap32768.png)
-![p90 latency vs. Concurrency (lockfree, cap=32768)](plots/p90_vs_cur_lockfree_cap32768.png)
+<p float="left">
+  <img src="plots/p90_vs_cur_lockfree_cap32768.png" width="400"/>
+  <img src="plots/p90_vs_cur_lock_cap32768.png" width="400"/>
+</p>
 ### Speedup ratio
-![Speedup (Lockfree / Lock) by Concurrency](plots/speedup_lockfree_over_lock_by_cur.png)
-![Speedup (Lockfree / Lock) vs. Concurrency](plots/speedup_vs_cur_cap32768.png)
-Perfect — since you already scripted the workflow, your README’s **How to Reproduce** section should reference those shell helpers instead of manual loops. Here’s the Markdown block tailored to your `build_benches.sh` and `run_matrix.sh`:
+<p float="left">
+  <img src="plots/speedup_lockfree_over_lock_by_cur.png" width="400"/>
+  <img src="plots/speedup_vs_cur_cap32768.png" width="400"/>
+</p>
 
 ## How to Reproduce
 
