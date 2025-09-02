@@ -8,16 +8,19 @@
 #include <unordered_map>
 
 static const std::size_t MAX_THREADS = std::thread::hardware_concurrency();
-static constexpr uint16_t SIMULATION_TIME_S = 60; // in seconds
+static constexpr uint16_t SIMULATION_TIME_S = 30; // in seconds
 
 alignas(CLS) std::atomic<std::size_t> consumer_fails;
 alignas(CLS) std::atomic<uint64_t> successfully_processed;
-alignas(CLS)
-    std::atomic<uint64_t> emitted_window_id; // previous 100ms window emitted
-alignas(CLS) std::atomic<uint64_t> cur_shared_window_id; // current 100ms window
-                                                         // being constructed.
+alignas(CLS) std::atomic<uint64_t> emitted_window_id{
+    0}; // previous 100ms window emitted
+alignas(CLS) std::atomic<uint64_t> cur_shared_window_id{
+    0}; // current 100ms window being constructed
 alignas(CLS) std::atomic_flag emitter_busy = ATOMIC_FLAG_INIT;
 std::mutex shard_lock;
+
+// ==== NEW: simulation start (ns since epoch) to normalize window ids to 0
+alignas(CLS) std::atomic<uint64_t> sim_t0_ns{0};
 
 static std::array<Multicast_grp, 14> multicast_groups{{{"224.0.0.1", "3000"},
                                                        {"224.0.1.0", "3001"},
@@ -43,6 +46,9 @@ struct Accum {
   uint32_t msg_count;
   uint32_t buy_count;
   uint32_t sell_count;
+  // Exact queue-wait mean support
+  uint64_t qwait_sum_ns = 0;
+  uint64_t qwait_cnt = 0;
 };
 
 using Shard = std::unordered_map<std::string, Accum>;
@@ -97,7 +103,6 @@ static inline void histo_percentiles(const Histo64 &h, uint64_t &p50,
     return;
   }
 
-  const uint64_t n = h.samples;
   const uint64_t k50 = (h.samples + 1) * 0.5;
   const uint64_t k90 = (h.samples + 1) * 0.9;
   const uint64_t k99 = (h.samples + 1) * 0.99;
@@ -133,16 +138,24 @@ static inline void histo_percentiles(const Histo64 &h, uint64_t &p50,
   }
 }
 
-static void emit_csv_header_once() {
+static void emit_csv_header_once(ssize_t recv, ssize_t send, ssize_t msg_proc) {
   static std::once_flag once;
-  std::call_once(once, [] {
-    stats_out
-        << "schema,1\n"
-        << "ts_start_ns,ts_end_ns,window_id,sym,"
-        << "buy_qty,sell_qty,buy_notional,sell_notional,"
-        << "buy_trades,sell_trades,buy_vwap,sell_vwap,imbalance,"
-        << "qwait_p50_ns,qwait_p90_ns,qwait_p99_ns,qwait_max_ns,qwait_count,"
-        << "drops_full,drops_oversize,recv_count,parse_errs,partial\n";
+  std::call_once(once, [recv, send, msg_proc] {
+    stats_out << "impl,lockfree\n"
+              << "threads, udp_recv=" << recv << ",udp_send=" << send
+              << ",msg_proc=" << msg_proc << "\n"
+              << "host, i7-12650H" << "\n"
+              << "build, O3-march=native\n"
+              << "cur_mcgrp," << CUR_MCGRP << "\n"
+              << "send_rate, fixed\n"
+              << "schema,1\n"
+              << "ts_start_ns,ts_end_ns,window_id,sym,"
+              << "buy_qty,sell_qty,buy_notional,sell_notional,"
+              << "buy_trades,sell_trades,buy_vwap,sell_vwap,imbalance,"
+              << "qwait_p50_ns,qwait_p90_ns,qwait_p99_ns,qwait_max_ns,qwait_"
+                 "count,"
+              << "qwait_mean_ns,"
+              << "drops_full,drops_oversize,recv_count,parse_errs,partial\n";
     stats_out.flush();
   });
 }
@@ -159,6 +172,7 @@ static void emit_symbol_row(uint64_t ts_start_ns, uint64_t ts_end_ns,
                             uint64_t drops_full, uint64_t drops_oversize,
                             uint64_t recv_count, uint64_t parse_errs,
                             int partial) {
+  long double q_mean = (a.qwait_cnt) ? (a.qwait_sum_ns / a.qwait_cnt) : 0;
   long double buy_vwap =
       safe_div((double)a.buy_notional, (double)std::max<int64_t>(a.buy_qty, 1));
   long double sell_vwap = safe_div((double)a.sell_notional,
@@ -171,26 +185,13 @@ static void emit_symbol_row(uint64_t ts_start_ns, uint64_t ts_end_ns,
             << ',' << a.sell_notional << ',' << a.buy_count << ','
             << a.sell_count << ',' << buy_vwap << ',' << sell_vwap << ',' << imb
             << ',' << q_p50 << ',' << q_p90 << ',' << q_p99 << ',' << q_max
-            << ',' << q_n << ',' << drops_full << ',' << drops_oversize << ','
-            << recv_count << ',' << parse_errs << ',' << partial << '\n';
-
-  // compact human-readable line for stdout (optional)
-  // std::cout << '[' << window_id << "][" << sym << "] "
-  //           << "qty(b/s)=" << a.buy_qty << '/' << a.sell_qty
-  //           << " notl(b/s)=" << a.buy_notional << '/' << a.sell_notional
-  //           << " vwap(b/s)=" << (double)buy_vwap << '/' << (double)sell_vwap
-  //           << " imb=" << imb << " qwait_us(p50/p90/p99/max)=" << q_p50 <<
-  //           '/'
-  //           << q_p90 << '/' << q_p99 << '/' << q_max << " n=" << q_n
-  //           << " drops_full=" << drops_full
-  //           << " drops_oversize=" << drops_oversize << " recv=" << recv_count
-  //           << " parse_errs=" << parse_errs << (partial ? " PARTIAL" : "")
-  //           << '\n';
+            << ',' << q_n << ',' << q_mean << ',' << drops_full << ','
+            << drops_oversize << ',' << recv_count << ',' << parse_errs << ','
+            << partial << '\n';
 }
 
 void msg_processor() {
   Payload_t rx_msg;
-  std::size_t batch_cnt = 0;
   std::size_t local_processed = 0;
 
   uint64_t window_id{0}, prev_window_id{0};
@@ -206,11 +207,17 @@ void msg_processor() {
       }
     }
 
-    // qwait observe
-    uint64_t q_ns = now_ns() - rx_msg.rx_ns; // enqueue->dequeue time
+    // normalize window-id to simulation start
+    const uint64_t base = sim_t0_ns.load(std::memory_order_acquire);
 
+    // qwait observe (enqueue->dequeue time)
+    const uint64_t q_ns = now_ns() - rx_msg.rx_ns;
     local_qwait.observe_ns(q_ns);
-    window_id = rx_msg.rx_ns / 100'000'000ull; // window of 100 ms
+
+    // bucket by 100 ms windows starting at 0
+    const uint64_t relns =
+        (rx_msg.rx_ns >= base) ? (rx_msg.rx_ns - base) : 0ULL;
+    window_id = relns / 100'000'000ull; // 100 ms windows
 
     auto [sym, qty, px, side] = feed.interpret_fix_message(
         rx_msg.data, rx_msg.len); // get relevant data
@@ -235,6 +242,8 @@ void msg_processor() {
           a.sell_notional += accum.sell_notional;
           a.buy_qty += accum.buy_qty;
           a.sell_qty += accum.sell_qty;
+          a.qwait_sum_ns += accum.qwait_sum_ns;
+          a.qwait_cnt += accum.qwait_cnt;
         }
         histo_merge(local_qwait, active_qwait);
       }
@@ -248,6 +257,8 @@ void msg_processor() {
     std::string key(sym);
     auto &a = shard[key];
     a.msg_count++;
+    a.qwait_cnt++;
+    a.qwait_sum_ns += q_ns;
     if (side == 1) {
       a.buy_count++;
       a.buy_qty += qty;
@@ -274,6 +285,8 @@ End:
       a.sell_notional += accum.sell_notional;
       a.buy_qty += accum.buy_qty;
       a.sell_qty += accum.sell_qty;
+      a.qwait_sum_ns += accum.qwait_sum_ns;
+      a.qwait_cnt += accum.qwait_cnt;
     }
     histo_merge(local_qwait, active_qwait);
   }
@@ -320,8 +333,10 @@ std::fstream stats_out;
 
 int main() {
   std::string stats_path;
-  std::cout << "File path to write results... ";
   std::cin >> stats_path;
+
+  // set simulation time-zero before launching any threads
+  sim_t0_ns.store(now_ns(), std::memory_order_release);
 
   std::cout << "Running UDP FIX MPMC Data Pipeline with " << MAX_THREADS
             << " threads...\n";
@@ -343,11 +358,6 @@ int main() {
     return 1;
   }
 
-  std::cout << "THREAD DISTRIBUTION:\n";
-  std::cout << "     UDP RECEIVERS=" << udp_recv_threads << "\n";
-  std::cout << "     UDP SENDERS=" << udp_send_threads << "\n";
-  std::cout << "     MESSAGE PROCESSORS=" << message_proc_threads << "\n";
-
   std::vector<std::thread> threads;
 
   for (int i{}; i < udp_send_threads; ++i) {
@@ -363,7 +373,8 @@ int main() {
     threads.emplace_back(msg_processor);
   }
 
-  emit_csv_header_once();
+  emit_csv_header_once(udp_recv_threads, udp_send_threads,
+                       message_proc_threads);
 
   // install signal handler to flip `running=false` (declared in
   // udp_multicast.cpp)
@@ -374,7 +385,6 @@ int main() {
 
   auto t0 = std::chrono::steady_clock::now(); // run simulation for fixed time
 
-  uint64_t avg_dequeue_ns = 0;
   std::size_t idx = 0;
   uint64_t win_ns = 100'000'000ull;
   while (running.load(std::memory_order_acquire)) {
@@ -382,12 +392,12 @@ int main() {
     uint64_t last = emitted_window_id.load(std::memory_order_acquire);
     if (cur > last) {
       uint64_t W = last + 1;
-      uint64_t ts_start_ns = W * win_ns;
-      uint64_t ts_end_ns = (W + 1) * win_ns;
+      uint64_t ts_start_ns = W * win_ns;     // normalized to sim start
+      uint64_t ts_end_ns = (W + 1) * win_ns; // normalized
 
       Shard to_emit;
       Histo64 q_drain;
-      uint64_t drops_full, drops_oversize, recv_count, parse_errs;
+      uint64_t drops_full{}, drops_oversize{}, recv_count{}, parse_errs{};
 
       {
         std::lock_guard<std::mutex> lock(shard_lock);
@@ -398,8 +408,7 @@ int main() {
 
       snapshot_counters(drops_full, drops_oversize, recv_count, parse_errs);
 
-      uint64_t p50, p90, p99, pmax;
-      uint64_t qn;
+      uint64_t p50{}, p90{}, p99{}, pmax{}, qn{};
       histo_percentiles(q_drain, p50, p90, p99, pmax, qn);
 
       for (auto &kv : to_emit) {
@@ -408,9 +417,8 @@ int main() {
         emit_symbol_row(ts_start_ns, ts_end_ns, W, sym, a, p50, p90, p99, pmax,
                         qn, drops_full, drops_oversize, recv_count, parse_errs,
                         /*partial=*/0);
-        avg_dequeue_ns = ((avg_dequeue_ns * idx) + (p50)) / (idx + 1);
+        idx++;
       }
-      idx++;
       emitted_window_id.store(W, std::memory_order_release);
       stats_out.flush();
     }
@@ -418,14 +426,11 @@ int main() {
     if (now - t0 >= std::chrono::seconds(SIMULATION_TIME_S)) {
       request_stop_and_unblock_io();
 
-      std::cout << "Waiting for threads...\n";
       for (std::thread &th : threads) {
         if (th.joinable()) {
           th.join();
         }
       }
-
-      std::cout << "Threads finished...\n";
 
       break;
     }
@@ -441,7 +446,9 @@ int main() {
     uint64_t cur = cur_shared_window_id.load(std::memory_order_relaxed);
     uint64_t W = cur; // treat current as final window id
     uint64_t ts_start_ns = W * win_ns;
-    uint64_t ts_end_ns = now_ns(); // partial end at shutdown
+
+    // normalized partial end at shutdown
+    uint64_t ts_end_ns = now_ns() - sim_t0_ns.load(std::memory_order_acquire);
 
     Shard to_emit;
     Histo64 q_drain;
@@ -470,14 +477,6 @@ int main() {
 
   double throughput = successfully_processed.load(std::memory_order_relaxed) *
                       1.0f / SIMULATION_TIME_S;
-
-  std::cout
-      << "$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$\n";
-  std::cout << SIMULATION_TIME_S << " SECOND STATS LINE\n";
-  std::cout << "    AVERAGE DEQUEUE LATENCY: " << avg_dequeue_ns << "ns\n";
-  std::cout << "    TOTAL PROCESSED: " << successfully_processed
-            << " FIX messages\n";
-  std::cout << "    THROUGHPUT (msg/s): " << throughput << "\n";
 
   receiver_stream.close();
   sender_stream.close();

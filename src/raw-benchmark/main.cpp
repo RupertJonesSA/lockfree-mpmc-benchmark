@@ -11,7 +11,7 @@
 
 static constexpr std::size_t MAXN = 1 << 10;
 static constexpr std::size_t N_TRIALS = 50;
-static const int MAX_THREADS = std::thread::hardware_concurrency();
+static const std::size_t MAX_THREADS = std::thread::hardware_concurrency();
 
 static std::mutex mx;
 
@@ -51,14 +51,14 @@ void consumer(int nItems, std::unique_ptr<BUFFER_T> &buffer,
 
 template <typename BUFFER_T, typename PAYLOAD_T>
 BufferTestStats runBufferTest(std::size_t nWrites, std::size_t nThreads) {
-  int nP = nThreads >> 1, nC = (nThreads >> 1) + (nThreads & 1);
+  uint8_t nP = nThreads >> 1, nC = (nThreads >> 1) + (nThreads & 1);
 
   std::vector<PAYLOAD_T> output;
-  int divW = nWrites / nP;
-  int remW = nWrites % nP;
+  std::size_t divW = nWrites / nP;
+  std::size_t remW = nWrites % nP;
 
-  int divR = nWrites / nC;
-  int remR = nWrites % nC;
+  std::size_t divR = nWrites / nC;
+  std::size_t remR = nWrites % nC;
 
   producer_fails.store(0, std::memory_order_relaxed);
   consumer_fails.store(0, std::memory_order_relaxed);
@@ -73,7 +73,7 @@ BufferTestStats runBufferTest(std::size_t nWrites, std::size_t nThreads) {
 
     std::vector<std::jthread> producers(nP), consumers(nC);
 
-    for (int i{}; i < nP; ++i) {
+    for (std::size_t i{}; i < nP; ++i) {
       producers[i] =
           std::jthread(producer<BUFFER_T, PAYLOAD_T>, divW + (i < remW ? 1 : 0),
                        i, std::ref(buffer));
@@ -143,7 +143,6 @@ template <typename T> double percent_error(const T a, const T b) {
 
 int main() {
   int nWrites{};
-  char response{};
   std::cout << "Number of writes: ";
   std::cin >> nWrites;
 

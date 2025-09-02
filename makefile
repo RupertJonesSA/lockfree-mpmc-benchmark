@@ -1,7 +1,6 @@
 CXX := g++
-CXXFLAGS := -std=c++20 -Wall -Wextra -O2 -pthread
+CXXFLAGS := -std=c++20 -Wall -Wextra -O3 -march=native -pthread
 DEBUG_FLAGS := -g -DDEBUG -fsanitize=thread
-RELEASE_FLAGS := -O3 -DNDEBUG -march=native
 VALGRIND_FLAGS := --leak-check=full --show-leak-kinds=all \
                   --track-origins=yes --num-callers=50 \
                   --error-exitcode=1

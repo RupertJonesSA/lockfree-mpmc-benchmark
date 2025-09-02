@@ -75,13 +75,6 @@ inline Buffer_t msg_ring_buffer;
 
 std::array<int, CUR_MCGRP * 2> all_udp_fds;
 
-void handle_signal(int signal) {
-  running.store(false, std::memory_order_release);
-  for (int fd : all_udp_fds) {
-    shutdown(fd, SHUT_RD); // unblocks
-  }
-}
-
 inline uint64_t now_ns() {
   using namespace std::chrono;
   return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch())
@@ -210,7 +203,7 @@ void *udp_receiver(Multicast_grp info, int id) {
       // Process the received message
       msg[bytes_recv] = '\0';
 
-      if (bytes_recv > MAX_RX) {
+      if (bytes_recv > static_cast<ssize_t>(MAX_RX)) {
         oversize_drops.fetch_add(1, std::memory_order_relaxed);
         continue; // Don't process oversized messages
       }
@@ -241,7 +234,7 @@ int udp_sender(Multicast_grp multicast_grp, int id) {
   int sendfd{};
   ssize_t bytes_sent{};
   struct sockaddr_in out_addr;
-  char ip_present[INET_ADDRSTRLEN];
+  // char ip_present[INET_ADDRSTRLEN];
   std::string msg;
   std::stringstream oss;
 
