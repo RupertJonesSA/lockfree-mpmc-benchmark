@@ -1,7 +1,7 @@
 # Lock vs Lock-Free Multi-producer/Multi-consumer Queue: Implementation & Performance Evaluation
 
 ## Overview
-This repository provides a hobbists implementation of the classical multi-producer/multiconsumer (MPMC) concurrency scenario.
+This repository provides a hobbist's implementation of the classical multi-producer/multiconsumer (MPMC) concurrency scenario.
 Two approaches were taken to achieve both synchronization and maximal concurrent gain: a **lock-based** and a **lock-free** buffer. 
 Aside from theory, the goal is to understand how synchronization design choices affect **throuhgput** and **latency under load** in realistic
 message-passing workloads (e.g., market data ingestion pipelines).
@@ -187,4 +187,5 @@ These were incredibly helpful for me when learning about C++ multithreading and 
 - https://www.1024cores.net/home/lock-free-algorithms/introduction (Dmitry Vyukov blog page; Google researcher who is a veteran in the field)
 - https://pages.cs.wisc.edu/~remzi/OSTEP/ (Free OS textbook that is a fantastic reference book for topics involving concurrency)
 - https://www.bogotobogo.com/cplusplus/files/CplusplusConcurrencyInAction_PracticalMultithreading.pdf (Goes over EVERYTHING C++ specific. Extermely detailed and thorough examination of C++ constructs involving multithreading since C++11)
+
 
